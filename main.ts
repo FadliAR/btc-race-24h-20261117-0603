@@ -32,7 +32,7 @@ const BPS = 10000;
 const MAX_SLIPPAGE_BPS = 200;
 
 // Strategy parameters (tuned only on the dev window via grade-local).
-const LOOKBACK = 150; // bars of trailing high
+const LOOKBACK = 180; // bars of trailing high
 const DIP_BPS = 120; // buy when this far below the trailing high
 const TP_BPS = 150;
 const SL_BPS = 100;
