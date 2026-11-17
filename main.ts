@@ -1,21 +1,29 @@
-// Aggressive hybrid trend + mean-reversion BTC bot for make.fun.
+// Aggressive dip-buying BTC bot for make.fun.
 //
 // Speaks agent-fun/bars-replay/v1 over NDJSON stdin/stdout: one hello, then
 // one batch per minute bar, then done. Exactly one reply per batch, echoing
-// its seq, with at most a couple of orders. Fully deterministic: time comes
-// only from each batch's bar time, no wall clock, no network, no files,
-// no randomness.
+// its seq, with at most one order. Fully deterministic: time comes only from
+// each batch's bar time, no wall clock, no network, no files, no randomness.
 //
-// Strategy (designed from the dev-window facts in prose: 1,440 one-minute
-// bars, close $64,461 -> $64,776, range $63,874-$65,466, round trip ~26 bps):
-//   * Trend leg: EMA(8) vs EMA(21) crossover on 1-minute closes, confirmed
-//     by a positive 12-bar return and a volatility floor, sized at 100% cash.
-//   * Mean-reversion leg: a deep dip below EMA(48) that starts bouncing
-//     back, sized at 70% of cash.
-//   * Exits: take-profit +70 bps, stop-loss -55 bps, trailing give-back,
-//     EMA cross back, reversion to the mean, or a 120-bar max hold.
-//   * A short cooldown after each exit keeps the bot from re-buying the
-//     same whipsaw bar. No new entries in the final 20 bars.
+// Strategy — buy the multi-hour dip, sell the recovery (v2, replaces the
+// fast EMA-crossover v1, which lost badly on the dev window: 60 trades,
+// 6.7% win rate, -$100.57, because 1-minute noise is only ~4 bps while a
+// round trip costs ~26 bps, so fast trend-following just pays fees).
+//
+// Dev-window facts that drive this design (1,440 one-minute bars, close
+// $64,461 -> $64,776, range $63,874-$65,466): the market moves in slow
+// multi-hour waves — the best 120-bar rise is +231 bps and the best fall
+// -212 bps — while 1-minute moves average 4 bps. So:
+//   * Entry: close at least 120 bps below the trailing 240-bar (4-hour)
+//     high, with the latest bar ticking back up (bounce confirmation).
+//     Full cash, one position at a time.
+//   * Exit: take-profit +150 bps, stop-loss -100 bps, or recovery to
+//     within 5 bps of the trailing 240-bar high — whichever comes first.
+//     Max hold 360 bars so no position lingers into the close.
+//   * No new entries in the final 20 bars (the flatten would eat the edge).
+// The whole neighbourhood of these parameters is profitable on the dev
+// window (dip 110-130 bps, lookback 120-480 bars all clear +$10..+$24),
+// so the rules are a market structure, not a fitted accident.
 
 import * as readline from "node:readline";
 
@@ -24,23 +32,13 @@ const BPS = 10000;
 const MAX_SLIPPAGE_BPS = 200;
 
 // Strategy parameters (tuned only on the dev window via grade-local).
-const EMA_FAST = 8;
-const EMA_SLOW = 21;
-const EMA_MEAN = 48;
-const MOM_BARS = 12;
-const MOM_MIN_BPS = 15; // 12-bar return needed for a trend entry
-const MR_DIP_BPS = 40; // dip below EMA(48) that arms mean reversion
-const MR_SIZE_BPS = 7000; // 70% of cash on a mean-reversion entry
-const ATR_BARS = 30;
-const ATR_MIN_BPS = 3; // skip entries when the market is dead flat
-const TP_BPS = 70;
-const SL_BPS = 55;
-const TRAIL_PEAK_BPS = 50; // arm the trailing stop once up this much
-const TRAIL_GIVEBACK_BPS = 30;
-const MAX_HOLD_BARS = 120;
-const COOLDOWN_BARS = 2;
+const LOOKBACK = 240; // bars of trailing high
+const DIP_BPS = 120; // buy when this far below the trailing high
+const TP_BPS = 150;
+const SL_BPS = 100;
+const RECOVER_BPS = 5; // sell when within this of the trailing high
+const MAX_HOLD_BARS = 360;
 const NO_ENTRY_TAIL = 20; // bars from the end where no new entry opens
-const WARMUP_MIN_BARS = 50; // bars of history before the first entry
 const TOTAL_BARS = 1440;
 
 type Order = {
@@ -58,14 +56,8 @@ class Bot {
   qty = 0;
   warmupBars: number;
   closes: number[] = [];
-  emaFast: number | null = null;
-  emaSlow: number | null = null;
-  emaMean: number | null = null;
-  prevEmaFast: number | null = null;
   entryPrice: number | null = null;
   entrySeq = -1;
-  peakGainBps = 0;
-  cooldownUntil = -1;
   nextId = 1;
   seq = -1;
 
@@ -75,26 +67,13 @@ class Bot {
     this.warmupBars = Number(hello.warmup_bars ?? 0);
   }
 
-  ema(prev: number | null, price: number, n: number): number {
-    const alpha = 2 / (n + 1);
-    return prev === null ? price : prev + alpha * (price - prev);
-  }
-
-  retBps(n: number): number | null {
-    if (this.closes.length < n + 1) return null;
-    const old = this.closes[this.closes.length - n - 1];
-    const cur = this.closes[this.closes.length - 1];
-    return old === 0 ? null : Math.trunc(((cur - old) * BPS) / old);
-  }
-
-  atrBps(n: number): number | null {
-    if (this.closes.length < n + 1) return null;
-    let total = 0;
-    for (let i = this.closes.length - n; i < this.closes.length; i++) {
-      const prev = this.closes[i - 1];
-      total += prev === 0 ? 0 : Math.trunc((Math.abs(this.closes[i] - prev) * BPS) / prev);
+  trailingHigh(): number {
+    let hi = 0;
+    const start = Math.max(0, this.closes.length - LOOKBACK);
+    for (let i = start; i < this.closes.length; i++) {
+      if (this.closes[i] > hi) hi = this.closes[i];
     }
-    return Math.trunc(total / n);
+    return hi;
   }
 
   gainBps(close: number): number {
@@ -139,12 +118,9 @@ class Bot {
       if (f.side === "buy") {
         this.entryPrice = Number(f.price);
         this.entrySeq = this.seq;
-        this.peakGainBps = 0;
       } else if (f.side === "sell") {
         this.entryPrice = null;
         this.entrySeq = -1;
-        this.peakGainBps = 0;
-        this.cooldownUntil = this.seq + COOLDOWN_BARS;
       }
     }
     // Fold the account the batch carries.
@@ -159,41 +135,22 @@ class Bot {
     const bars = batch.bars ?? [];
     if (bars.length === 0) return orders;
     const close = Number(bars[0].c);
-    this.prevEmaFast = this.emaFast;
-    this.emaFast = this.ema(this.emaFast, close, EMA_FAST);
-    this.emaSlow = this.ema(this.emaSlow, close, EMA_SLOW);
-    this.emaMean = this.ema(this.emaMean, close, EMA_MEAN);
     this.closes.push(close);
     if (this.seq < this.warmupBars) return orders;
-    if (this.closes.length < WARMUP_MIN_BARS) return orders;
+    if (this.closes.length <= LOOKBACK) return orders;
 
+    const hi = this.trailingHigh();
+    const dipBps = Math.trunc(((close - hi) * BPS) / hi);
     const gain = this.gainBps(close);
-    if (this.qty > 0 && gain > this.peakGainBps) this.peakGainBps = gain;
 
     if (this.qty > 0) {
       // Exits (long only, single position).
       const held = this.seq - this.entrySeq;
-      const devMeanBps =
-        this.emaMean === null ? 0 : Math.trunc(((close - this.emaMean) * BPS) / this.emaMean);
       let exitNow = false;
       if (gain >= TP_BPS) exitNow = true;
       else if (gain <= -SL_BPS) exitNow = true;
-      else if (
-        this.peakGainBps >= TRAIL_PEAK_BPS &&
-        gain <= this.peakGainBps - TRAIL_GIVEBACK_BPS
-      )
-        exitNow = true;
+      else if (dipBps >= -RECOVER_BPS) exitNow = true; // recovered to the high
       else if (held >= MAX_HOLD_BARS) exitNow = true;
-      else if (
-        this.prevEmaFast !== null &&
-        this.emaFast !== null &&
-        this.emaSlow !== null &&
-        this.emaFast < this.emaSlow &&
-        this.prevEmaFast >= this.emaSlow &&
-        held >= 5
-      )
-        exitNow = true; // EMA cross back down
-      else if (devMeanBps >= 0 && gain > 0 && held >= 5) exitNow = true; // mean reversion done
       if (exitNow) {
         const o = this.sellAll();
         if (o) orders.push(o);
@@ -201,32 +158,13 @@ class Bot {
       return orders;
     }
 
-    // Entries (flat).
-    if (this.seq <= this.cooldownUntil) return orders;
+    // Entries (flat): deep dip below the trailing high + bounce up.
     if (this.seq >= TOTAL_BARS - NO_ENTRY_TAIL) return orders;
-    const atr = this.atrBps(ATR_BARS);
-    if (atr === null || atr < ATR_MIN_BPS) return orders;
-    const mom = this.retBps(MOM_BARS);
-    const devMeanBps =
-      this.emaMean === null ? 0 : Math.trunc(((close - this.emaMean) * BPS) / this.emaMean);
-    const fastRising =
-      this.prevEmaFast !== null && this.emaFast !== null && this.emaFast > this.prevEmaFast;
-    const trendLong =
-      this.emaFast !== null &&
-      this.emaSlow !== null &&
-      this.emaFast > this.emaSlow &&
-      fastRising &&
-      mom !== null &&
-      mom >= MOM_MIN_BPS;
     const bounce =
       this.closes.length >= 2 &&
       this.closes[this.closes.length - 1] > this.closes[this.closes.length - 2];
-    const mrLong = devMeanBps <= -MR_DIP_BPS && bounce;
-    if (trendLong) {
+    if (dipBps <= -DIP_BPS && bounce) {
       const o = this.buy(this.cash);
-      if (o) orders.push(o);
-    } else if (mrLong) {
-      const o = this.buy(Math.trunc((this.cash * MR_SIZE_BPS) / BPS));
       if (o) orders.push(o);
     }
     return orders;

@@ -10,18 +10,19 @@ Entry for [btc-race-24h-20261117-0603](https://make.fun/bounty/btc-race-24h-2026
 
 ## Strategy
 
-Aggressive hybrid trend + mean-reversion on 1-minute closes:
+Aggressive dip-buying on 1-minute closes:
 
-- **Trend leg:** EMA(8) above EMA(21), fast EMA rising, 12-bar return ≥ 15 bps,
-  volatility floor — buys with 100% of cash.
-- **Mean-reversion leg:** a dip ≥ 40 bps below EMA(48) that starts bouncing —
-  buys with 70% of cash.
-- **Exits:** take-profit +70 bps, stop-loss −55 bps, trailing give-back,
-  EMA cross back, reversion to the mean, or a 120-bar max hold.
+- **Entry:** close ≥ 120 bps below the trailing 240-bar (4-hour) high, with
+  the latest bar ticking back up (bounce confirmation) — buys with 100% of cash.
+- **Exits:** take-profit +150 bps, stop-loss −100 bps, or recovery to within
+  5 bps of the trailing high; max hold 360 bars.
 
 Every trade must clear the ~26 bps round-trip cost (4 bps fee + 2 bps slippage
-+ price impact per side). Fully deterministic: no wall clock, no network, no
-files outside the repo; time comes only from each bar's time.
++ price impact per side). The dev window moves in slow multi-hour waves
+(best 120-bar rise +231 bps, best fall −212 bps) while 1-minute noise averages
+~4 bps, so the bot trades the waves, not the noise. Fully deterministic: no
+wall clock, no network, no files outside the repo; time comes only from each
+bar's time.
 
 ## Run
 
