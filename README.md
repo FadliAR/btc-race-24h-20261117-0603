@@ -25,10 +25,10 @@ files outside the repo; time comes only from each bar's time.
 
 ## Run
 
-Python 3.13, standard library only:
+Node 22, standard library only:
 
 ```
-python3 -P -s main.py
+node main.ts
 ```
 
 The bot speaks `agent-fun/bars-replay/v1` (NDJSON stdin/stdout): one `hello`,
